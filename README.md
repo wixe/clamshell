@@ -15,7 +15,8 @@
 **Clamshell** is a native, featherweight macOS menu bar app (`Clamshell.app`), CLI utility (`clamshell`), and background system daemon (`clamshelld`) that unifies **keep-awake session management** (replacing Amphetamine) with **hardware clamshell & Retina LCD backlight control**:
 
 * **Closed-Clamshell Zero-Backlight Server Mode:** Detects the hardware Hall-effect lid sensor (`AppleClamshellState` in `IOPMrootDomain`). When the lid is closed, Clamshell keeps the system awake while driving the physical display backlight to **`0.00` (`0%` — completely dark, zero wasted energy, zero heat inside the closed clamshell, zero panel burn-in)**.
-* **Instant Open-Lid Brightness Restoration:** The moment you open the clamshell (`AppleClamshellState: Closed → Open`), Clamshell automatically restores your display backlight to your last active open-lid brightness so you can work interactively right away.
+* **Closed-Clamshell Built-In Speaker Auto-Mute (`CoreAudio`):** Automatically mutes the MacBook's physical built-in speakers (`kAudioDeviceTransportTypeBuiltIn`) when the lid is closed so sound never plays out of a closed laptop in another room — while leaving remote and virtual audio outputs (High Performance Screen Sharing, AirPlay, BlackHole, SonoBus) 100% active. Unmutes automatically when you open the lid.
+* **Instant Open-Lid Brightness & Audio Restoration:** The moment you open the clamshell (`AppleClamshellState: Closed → Open`), Clamshell automatically restores your display backlight to your last active open-lid brightness and unmutes your built-in speakers so you can work interactively right away.
 * **WindowServer & GPU Stay 100% Online (No HDMI Dummy Plug Needed):** Unlike `pmset displaysleepnow` (which puts `WindowServer` to sleep and locks the macOS GUI session), Clamshell turns off the physical LED backlight via `DisplayServices.framework` while keeping `WindowServer` and the GPU framebuffer online. Remote desktop (`Screen Sharing`), headless GUI apps, and audio/video rendering continue running at full hardware acceleration.
 * **Full Amphetamine Replacement:** Supports **24/7 Indefinite Awake**, **AC Power Only**, and **Timed Countdown Sessions** (`30m` to `12h+`) with a configurable **Battery Safety Floor** (default `20%`) that automatically suspends keep-awake if discharging on battery below your safety threshold.
 * **Open-Lid Idle Blackout:** Optionally turns off the physical backlight (`0%`) after a configurable period of keyboard/trackpad inactivity (`HIDIdleTime` via `IOHIDSystem`, e.g., `5 minutes`) when the lid is left open, and wakes the backlight the instant you touch the keyboard or trackpad.
@@ -96,6 +97,9 @@ clamshell brightness 65
 
 # Toggle automatic 0% display blackout when clamshell lid is closed
 clamshell blackout on
+
+# Toggle automatic built-in speaker mute when clamshell lid is closed
+clamshell mute on
 
 # Turn off display backlight after 5 minutes (300s) of open-lid keyboard/trackpad inactivity
 clamshell idle 300

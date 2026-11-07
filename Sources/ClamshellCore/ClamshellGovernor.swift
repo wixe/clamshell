@@ -38,13 +38,21 @@ public final class ClamshellGovernor {
         if state.isBacklightBlackedOut && !tel.isClamshellClosed {
             _ = DisplayBacklightController.shared.setBrightness(config.savedBrightness)
         }
+        if state.isSpeakerMutedByClamshell && !tel.isClamshellClosed {
+            _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
+        }
     }
 
     public func updateConfig(_ newConfig: ClamshellConfig, reason: String = "User updated configuration") {
         queue.sync {
+            let prevMutePolicy = self.config.muteSpeakersWhenClosed
             self.config = newConfig
             _ = ConfigManager.shared.save(newConfig)
             self.state.lastActionReason = reason
+            if prevMutePolicy && !newConfig.muteSpeakersWhenClosed {
+                _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
+                self.state.isSpeakerMutedByClamshell = false
+            }
             self.evaluateTick()
         }
     }
@@ -142,20 +150,25 @@ public final class ClamshellGovernor {
         )
         power.setKernelClamshellSleepDisabled(wantAwake, currentKernelState: tel.sleepDisabledKernel)
 
-        // 3. Clamshell & Idle Display Backlight State Machine
+        // 3. Clamshell & Idle Display Backlight + Built-in Speaker Mute State Machine
         let prevClosed = wasClamshellClosed
         wasClamshellClosed = tel.isClamshellClosed
 
         if tel.isClamshellClosed {
+            if config.muteSpeakersWhenClosed {
+                if !tel.builtInSpeakersMuted {
+                    _ = AudioOutputController.shared.setBuiltInSpeakersMuted(true)
+                }
+                state.isSpeakerMutedByClamshell = true
+            }
             if config.clamshellBlackoutEnabled {
-                // Save open-lid brightness if it was previously lit
                 if prevClosed == false && tel.currentBrightness > 0.03 {
                     config.savedBrightness = tel.currentBrightness
                     _ = ConfigManager.shared.save(config)
                 }
                 if tel.currentBrightness > 0.005 {
                     _ = DisplayBacklightController.shared.setBrightness(0.0)
-                    state.lastActionReason = "Clamshell closed → Display backlight off (0%)"
+                    state.lastActionReason = "Clamshell closed → 0% backlight & speakers muted"
                 }
                 state.isBacklightBlackedOut = true
                 state.blackoutReason = "Clamshell Closed (0% Backlight)"
@@ -168,14 +181,17 @@ public final class ClamshellGovernor {
 
         // Clamshell is OPEN:
         if prevClosed == true {
-            // Lid just opened! Restore saved brightness immediately
             manualBlackoutActive = false
             wasIdleBlackedOut = false
             let restoreVal = max(0.10, min(1.0, config.savedBrightness))
             _ = DisplayBacklightController.shared.setBrightness(restoreVal)
+            if config.muteSpeakersWhenClosed && state.isSpeakerMutedByClamshell {
+                _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
+                state.isSpeakerMutedByClamshell = false
+            }
             state.isBacklightBlackedOut = false
             state.blackoutReason = "Active (Open Lid)"
-            state.lastActionReason = String(format: "Clamshell opened → Restored brightness to %.0f%%", restoreVal * 100.0)
+            state.lastActionReason = String(format: "Clamshell opened → Restored %.0f%% brightness & unmuted speakers", restoreVal * 100.0)
             return
         }
 
@@ -198,7 +214,6 @@ public final class ClamshellGovernor {
         }
 
         if wasIdleBlackedOut && tel.hidIdleSeconds < 3.0 {
-            // User touched keyboard/trackpad while open-lid idle dimmed
             wasIdleBlackedOut = false
             manualBlackoutActive = false
             let restoreVal = max(0.10, min(1.0, config.savedBrightness))
@@ -209,7 +224,6 @@ public final class ClamshellGovernor {
             return
         }
 
-        // Normal open-lid operation: track user's manual brightness adjustments (F1/F2 or Control Center)
         if !manualBlackoutActive && tel.currentBrightness > 0.03 {
             if abs(tel.currentBrightness - config.savedBrightness) >= 0.03 {
                 config.savedBrightness = tel.currentBrightness
@@ -219,7 +233,6 @@ public final class ClamshellGovernor {
             state.blackoutReason = "Active (Open Lid)"
         } else if manualBlackoutActive {
             if tel.currentBrightness > 0.03 {
-                // User pressed F2 Brightness Up key after manual blackout
                 manualBlackoutActive = false
                 config.savedBrightness = tel.currentBrightness
                 _ = ConfigManager.shared.save(config)

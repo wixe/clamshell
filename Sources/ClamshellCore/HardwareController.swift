@@ -2,7 +2,180 @@ import Foundation
 import IOKit
 import IOKit.pwr_mgt
 import CoreGraphics
+import CoreAudio
 import Darwin
+
+public final class AudioOutputController {
+    public static let shared = AudioOutputController()
+
+    private init() {}
+
+    private func allDeviceIDs() -> [AudioDeviceID] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        let sysObj = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(sysObj, &addr, 0, nil, &dataSize) == noErr, dataSize > 0 else {
+            return []
+        }
+        let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+        var devices = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(sysObj, &addr, 0, nil, &dataSize, &devices) == noErr else {
+            return []
+        }
+        return devices
+    }
+
+    private func deviceName(_ id: AudioDeviceID) -> String {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var cfName: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let status = withUnsafeMutablePointer(to: &cfName) { ptr in
+            AudioObjectGetPropertyData(id, &addr, 0, nil, &size, ptr)
+        }
+        if status == noErr {
+            return cfName as String
+        }
+        return "Audio Output"
+    }
+
+    private func hasOutputStreams(_ id: AudioDeviceID) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr else {
+            return false
+        }
+        return size > 0
+    }
+
+    private func transportType(_ id: AudioDeviceID) -> UInt32 {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &transport) == noErr else {
+            return 0
+        }
+        return transport
+    }
+
+    /// Finds the physical built-in MacBook speaker device (excluding external/virtual/AirPlay/ScreenSharing outputs).
+    public func findBuiltInSpeakerDeviceID() -> AudioDeviceID? {
+        let candidates = allDeviceIDs().filter { id in
+            hasOutputStreams(id) && transportType(id) == kAudioDeviceTransportTypeBuiltIn
+        }
+        for id in candidates {
+            let name = deviceName(id).lowercased()
+            if name.contains("speaker") {
+                return id
+            }
+        }
+        // Fallback to any built-in output that isn't headphones
+        for id in candidates {
+            let name = deviceName(id).lowercased()
+            if !name.contains("headphone") {
+                return id
+            }
+        }
+        return candidates.first
+    }
+
+    public func defaultOutputDeviceID() -> AudioDeviceID? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var devID: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let sysObj = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyData(sysObj, &addr, 0, nil, &size, &devID) == noErr, devID != 0 else {
+            return nil
+        }
+        return devID
+    }
+
+    public func defaultOutputDeviceName() -> String {
+        guard let id = defaultOutputDeviceID() else { return "None" }
+        return deviceName(id)
+    }
+
+    public func isBuiltInSpeakersMuted() -> Bool {
+        guard let speakerID = findBuiltInSpeakerDeviceID() else { return false }
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1, 2] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: element
+            )
+            if AudioObjectHasProperty(speakerID, &addr) {
+                var muted: UInt32 = 0
+                var size = UInt32(MemoryLayout<UInt32>.size)
+                if AudioObjectGetPropertyData(speakerID, &addr, 0, nil, &size, &muted) == noErr {
+                    return muted != 0
+                }
+            }
+        }
+        return false
+    }
+
+    @discardableResult
+    public func setBuiltInSpeakersMutedDirect(_ muted: Bool) -> Bool {
+        guard let speakerID = findBuiltInSpeakerDeviceID() else { return false }
+        var didSet = false
+        let val: UInt32 = muted ? 1 : 0
+        let size = UInt32(MemoryLayout<UInt32>.size)
+
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1, 2] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: element
+            )
+            if AudioObjectHasProperty(speakerID, &addr) {
+                var settable: DarwinBoolean = false
+                if AudioObjectIsPropertySettable(speakerID, &addr, &settable) == noErr && settable.boolValue {
+                    var mutableVal = val
+                    if AudioObjectSetPropertyData(speakerID, &addr, 0, nil, size, &mutableVal) == noErr {
+                        didSet = true
+                    }
+                }
+            }
+        }
+        return didSet
+    }
+
+    @discardableResult
+    public func setBuiltInSpeakersMuted(_ muted: Bool) -> Bool {
+        let directOK = setBuiltInSpeakersMutedDirect(muted)
+        if getuid() == 0 {
+            var st = stat()
+            if stat("/dev/console", &st) == 0 && st.st_uid != 0 {
+                let uid = st.st_uid
+                let bin = FileManager.default.isExecutableFile(atPath: ClamshellLayout.cliBinary)
+                    ? ClamshellLayout.cliBinary
+                    : ClamshellLayout.daemonBinary
+                _ = Shell.run("/bin/launchctl", ["asuser", "\(uid)", bin, "mute-sync", muted ? "1" : "0"])
+                return true
+            }
+        }
+        return directOK
+    }
+}
 
 public final class DisplayBacklightController {
     public static let shared = DisplayBacklightController()
@@ -79,8 +252,6 @@ public final class DisplayBacklightController {
         let clamped = max(0.0, min(1.0, value))
         let directOK = setBrightnessDirect(clamped)
 
-        // If running as root daemon (UID 0), also dispatch inside the active GUI console user session
-        // so WindowServer / DisplayServices always receives the update even when Menu Bar app is closed.
         if getuid() == 0 {
             var st = stat()
             if stat("/dev/console", &st) == 0 && st.st_uid != 0 {
@@ -105,6 +276,8 @@ public final class HardwareMonitor {
         let idleSec = readHIDIdleSeconds()
         let batt = readBatteryInfo()
         let brightness = DisplayBacklightController.shared.getBrightness()
+        let speakersMuted = AudioOutputController.shared.isBuiltInSpeakersMuted()
+        let outDevice = AudioOutputController.shared.defaultOutputDeviceName()
 
         let mainID = CGMainDisplayID()
         let online = CGDisplayIsOnline(mainID) != 0
@@ -126,6 +299,8 @@ public final class HardwareMonitor {
             currentBrightness: brightness,
             displayOnline: online,
             displayResolution: res,
+            builtInSpeakersMuted: speakersMuted,
+            audioOutputDeviceName: outDevice,
             hidIdleSeconds: idleSec,
             isACConnected: batt.isAC,
             isCharging: batt.isCharging,

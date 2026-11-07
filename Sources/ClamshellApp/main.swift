@@ -27,6 +27,7 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var brightnessSlider: NSSlider?
     private var brightnessValueLabel: NSTextField?
     private var blackoutCheckbox: NSButton?
+    private var muteSpeakersCheckbox: NSButton?
     private var idlePopup: NSPopUpButton?
     private var loginCheckbox: NSButton?
     private var installDaemonButton: NSButton?
@@ -48,6 +49,7 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private let inAppPower = PowerAssertionController()
     private var lastObservedClosed: Bool? = nil
     private var lastObservedIdleBlackout: Bool = false
+    private var wasSpeakerMutedByApp: Bool = false
 
     private let launchAgentPath: String = {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -125,6 +127,12 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         lastObservedClosed = tel.isClamshellClosed
 
         if tel.isClamshellClosed {
+            if cfg.muteSpeakersWhenClosed {
+                if !tel.builtInSpeakersMuted {
+                    _ = AudioOutputController.shared.setBuiltInSpeakersMutedDirect(true)
+                }
+                wasSpeakerMutedByApp = true
+            }
             if cfg.clamshellBlackoutEnabled {
                 if prevClosed == false && tel.currentBrightness > 0.03 {
                     cfg.savedBrightness = tel.currentBrightness
@@ -135,10 +143,14 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
                 }
             }
         } else if prevClosed == true {
-            // Clamshell just opened — restore saved brightness immediately!
+            // Clamshell just opened — restore saved brightness and unmute built-in speakers immediately!
             lastObservedIdleBlackout = false
             let restore = max(0.10, min(1.0, cfg.savedBrightness))
             _ = DisplayBacklightController.shared.setBrightnessDirect(restore)
+            if cfg.muteSpeakersWhenClosed && wasSpeakerMutedByApp {
+                _ = AudioOutputController.shared.setBuiltInSpeakersMutedDirect(false)
+                wasSpeakerMutedByApp = false
+            }
             rebuildMenu()
             refreshSettingsWindow()
         } else if cfg.idleDimSeconds > 0 && tel.hidIdleSeconds >= Double(cfg.idleDimSeconds) {
@@ -212,9 +224,14 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             ? String(format: "%.0fs", tel.hidIdleSeconds)
             : String(format: "%dm %ds", Int(tel.hidIdleSeconds) / 60, Int(tel.hidIdleSeconds) % 60)
 
+        let speakerInfoStr = tel.builtInSpeakersMuted
+            ? "Muted 🔇 (Remote/Virtual Audio Active)"
+            : "Unmuted 🔊 (Output: \(tel.audioOutputDeviceName))"
+
         let infoLines = [
             "Clamshell Lid: \(lidStateStr)",
             "Display Backlight: \(brightPct)% (Saved Open-Lid: \(savedPct)%)",
+            "Built-in Speakers: \(speakerInfoStr)",
             "WindowServer GPU: \(tel.displayOnline ? "Online" : "Offline") (\(tel.displayResolution))",
             "Keep-Awake Mode: \(daemonInfo.mode)",
             "Power & Battery: \(tel.batteryPercent)% (\(powerStr)) • Floor: \(cfg.batteryFloorPercent)%",
@@ -294,6 +311,15 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         lidBlackoutItem.target = self
         lidBlackoutItem.state = cfg.clamshellBlackoutEnabled ? .on : .off
         policyMenu.addItem(lidBlackoutItem)
+
+        let lidMuteItem = NSMenuItem(
+            title: "Mute Built-in Speakers When Clamshell Closed (Keep Remote Audio)",
+            action: #selector(toggleMuteSpeakersMenu),
+            keyEquivalent: ""
+        )
+        lidMuteItem.target = self
+        lidMuteItem.state = cfg.muteSpeakersWhenClosed ? .on : .off
+        policyMenu.addItem(lidMuteItem)
         policyMenu.addItem(.separator())
 
         let idleOptions: [(Int, String)] = [
@@ -564,21 +590,23 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             var down = columnTop
             down -= unit * 4
             let modeTitleY = down
-            down -= unit * 6
+            down -= unit * 5
             let modeSegY = down
-            down -= unit * 6
+            down -= unit * 5
             let brightTitleY = down
-            down -= unit * 6
+            down -= unit * 5
             let sliderY = down
-            down -= unit * 6
+            down -= unit * 5
             let blackoutY = down
-            down -= unit * 6
+            down -= unit * 4
+            let muteY = down
+            down -= unit * 5
             let idleY = down
             down -= unit * 5
             let loginY = down
-            down -= unit * 18
+            down -= unit * 17
             let updateY = down
-            down -= unit * 7
+            down -= unit * 6
             let buttonY = down
 
             let modeTitle = NSTextField(labelWithString: "Keep-Awake Mode (Replaces Amphetamine)")
@@ -637,6 +665,17 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             bCheck.frame = NSRect(x: controlX, y: blackoutY, width: controlW, height: unit * 4)
             content.addSubview(bCheck)
             self.blackoutCheckbox = bCheck
+
+            let mCheck = NSButton(
+                checkboxWithTitle: "Mute built-in MacBook speakers when clamshell is closed (keeps Screen Sharing / AirPlay audio)",
+                target: self,
+                action: #selector(toggleMuteSpeakersCheckbox(_:))
+            )
+            mCheck.state = cfg.muteSpeakersWhenClosed ? .on : .off
+            mCheck.controlSize = .small
+            mCheck.frame = NSRect(x: controlX, y: muteY, width: controlW, height: unit * 4)
+            content.addSubview(mCheck)
+            self.muteSpeakersCheckbox = mCheck
 
             let idleLabel = NSTextField(labelWithString: "Open-lid idle backlight off:")
             idleLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
@@ -731,7 +770,8 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let brightPct = Int((tel.currentBrightness * 100.0).rounded())
         let savedPct = Int((cfg.savedBrightness * 100.0).rounded())
 
-        headerSubLabel?.stringValue = "Lid: \(tel.isClamshellClosed ? "Closed 🦪" : "Open 💻")  •  Backlight: \(brightPct)% (Saved: \(savedPct)%)  •  WindowServer: \(tel.displayOnline ? "Online" : "Offline") (\(tel.displayResolution))"
+        let speakerStatus = tel.builtInSpeakersMuted ? "Muted 🔇" : "Unmuted 🔊"
+        headerSubLabel?.stringValue = "Lid: \(tel.isClamshellClosed ? "Closed 🦪" : "Open 💻")  •  Backlight: \(brightPct)%  •  Speakers: \(speakerStatus)  •  WindowServer: \(tel.displayOnline ? "Online" : "Offline") (\(tel.displayResolution))"
 
         if daemonActive && upToDate {
             daemonBadgeLabel?.stringValue = "✅ Background Daemon (clamshelld) Active — Closed-Clamshell Awake & Backlight Guard Enforced"
@@ -770,6 +810,7 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         brightnessSlider?.integerValue = brightPct
         brightnessValueLabel?.stringValue = "\(brightPct)%"
         blackoutCheckbox?.state = cfg.clamshellBlackoutEnabled ? .on : .off
+        muteSpeakersCheckbox?.state = cfg.muteSpeakersWhenClosed ? .on : .off
         idlePopup?.selectItem(withTag: cfg.idleDimSeconds)
         loginCheckbox?.state = isLaunchAtLoginEnabled() ? .on : .off
         uninstallDaemonButton?.isEnabled = daemonActive
@@ -873,6 +914,29 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         cfg.clamshellBlackoutEnabled = enabled
         _ = ConfigManager.shared.save(cfg)
         sendControl("BLACKOUT \(enabled ? "on" : "off")")
+        evaluateLocalSessionGuard()
+        rebuildMenu()
+        refreshSettingsWindow()
+    }
+
+    @objc private func toggleMuteSpeakersMenu() {
+        let cfg = ConfigManager.shared.load()
+        setMuteSpeakersWhenClosed(!cfg.muteSpeakersWhenClosed)
+    }
+
+    @objc private func toggleMuteSpeakersCheckbox(_ sender: NSButton) {
+        setMuteSpeakersWhenClosed(sender.state == .on)
+    }
+
+    private func setMuteSpeakersWhenClosed(_ enabled: Bool) {
+        var cfg = ConfigManager.shared.load()
+        cfg.muteSpeakersWhenClosed = enabled
+        _ = ConfigManager.shared.save(cfg)
+        if !enabled {
+            _ = AudioOutputController.shared.setBuiltInSpeakersMutedDirect(false)
+            wasSpeakerMutedByApp = false
+        }
+        sendControl("MUTE \(enabled ? "on" : "off")")
         evaluateLocalSessionGuard()
         rebuildMenu()
         refreshSettingsWindow()

@@ -30,6 +30,7 @@ public struct ClamshellConfig: Codable, Equatable {
     public var timedDurationMinutes: Int
     public var timedExpiresAtEpoch: Double?
     public var clamshellBlackoutEnabled: Bool
+    public var muteSpeakersWhenClosed: Bool
     public var idleDimSeconds: Int
     public var savedBrightness: Double
     public var batteryFloorPercent: Int
@@ -41,6 +42,7 @@ public struct ClamshellConfig: Codable, Equatable {
         timedDurationMinutes: Int = 60,
         timedExpiresAtEpoch: Double? = nil,
         clamshellBlackoutEnabled: Bool = true,
+        muteSpeakersWhenClosed: Bool = true,
         idleDimSeconds: Int = 300,
         savedBrightness: Double = 0.65,
         batteryFloorPercent: Int = 20,
@@ -51,11 +53,29 @@ public struct ClamshellConfig: Codable, Equatable {
         self.timedDurationMinutes = timedDurationMinutes
         self.timedExpiresAtEpoch = timedExpiresAtEpoch
         self.clamshellBlackoutEnabled = clamshellBlackoutEnabled
+        self.muteSpeakersWhenClosed = muteSpeakersWhenClosed
         self.idleDimSeconds = idleDimSeconds
         self.savedBrightness = max(0.05, min(1.0, savedBrightness))
         self.batteryFloorPercent = max(5, min(80, batteryFloorPercent))
         self.preventDisplaySleep = preventDisplaySleep
         self.pollIntervalSeconds = max(0.5, min(10.0, pollIntervalSeconds))
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.mode = (try? c.decode(AwakeMode.self, forKey: .mode)) ?? .indefinite
+        self.timedDurationMinutes = (try? c.decode(Int.self, forKey: .timedDurationMinutes)) ?? 60
+        self.timedExpiresAtEpoch = try? c.decode(Double.self, forKey: .timedExpiresAtEpoch)
+        self.clamshellBlackoutEnabled = (try? c.decode(Bool.self, forKey: .clamshellBlackoutEnabled)) ?? true
+        self.muteSpeakersWhenClosed = (try? c.decode(Bool.self, forKey: .muteSpeakersWhenClosed)) ?? true
+        self.idleDimSeconds = (try? c.decode(Int.self, forKey: .idleDimSeconds)) ?? 300
+        let sb = (try? c.decode(Double.self, forKey: .savedBrightness)) ?? 0.65
+        self.savedBrightness = max(0.05, min(1.0, sb))
+        let bf = (try? c.decode(Int.self, forKey: .batteryFloorPercent)) ?? 20
+        self.batteryFloorPercent = max(5, min(80, bf))
+        self.preventDisplaySleep = (try? c.decode(Bool.self, forKey: .preventDisplaySleep)) ?? true
+        let pi = (try? c.decode(Double.self, forKey: .pollIntervalSeconds)) ?? 2.0
+        self.pollIntervalSeconds = max(0.5, min(10.0, pi))
     }
 
     public static let `default` = ClamshellConfig()
@@ -66,6 +86,8 @@ public struct HardwareTelemetry: Codable, Equatable {
     public let currentBrightness: Double
     public let displayOnline: Bool
     public let displayResolution: String
+    public let builtInSpeakersMuted: Bool
+    public let audioOutputDeviceName: String
     public let hidIdleSeconds: Double
     public let isACConnected: Bool
     public let isCharging: Bool
@@ -80,6 +102,8 @@ public struct HardwareTelemetry: Codable, Equatable {
         currentBrightness: Double,
         displayOnline: Bool,
         displayResolution: String,
+        builtInSpeakersMuted: Bool = false,
+        audioOutputDeviceName: String = "Built-in Speakers",
         hidIdleSeconds: Double,
         isACConnected: Bool,
         isCharging: Bool,
@@ -93,6 +117,8 @@ public struct HardwareTelemetry: Codable, Equatable {
         self.currentBrightness = currentBrightness
         self.displayOnline = displayOnline
         self.displayResolution = displayResolution
+        self.builtInSpeakersMuted = builtInSpeakersMuted
+        self.audioOutputDeviceName = audioOutputDeviceName
         self.hidIdleSeconds = hidIdleSeconds
         self.isACConnected = isACConnected
         self.isCharging = isCharging
@@ -107,6 +133,7 @@ public struct HardwareTelemetry: Codable, Equatable {
 public struct GovernorState: Codable, Equatable {
     public var isAwakeAsserted: Bool
     public var isBacklightBlackedOut: Bool
+    public var isSpeakerMutedByClamshell: Bool
     public var blackoutReason: String
     public var modeDescription: String
     public var remainingTimedSeconds: Int?
@@ -115,6 +142,7 @@ public struct GovernorState: Codable, Equatable {
     public init(
         isAwakeAsserted: Bool = false,
         isBacklightBlackedOut: Bool = false,
+        isSpeakerMutedByClamshell: Bool = false,
         blackoutReason: String = "Active (Open Lid)",
         modeDescription: String = "Initializing…",
         remainingTimedSeconds: Int? = nil,
@@ -122,6 +150,7 @@ public struct GovernorState: Codable, Equatable {
     ) {
         self.isAwakeAsserted = isAwakeAsserted
         self.isBacklightBlackedOut = isBacklightBlackedOut
+        self.isSpeakerMutedByClamshell = isSpeakerMutedByClamshell
         self.blackoutReason = blackoutReason
         self.modeDescription = modeDescription
         self.remainingTimedSeconds = remainingTimedSeconds

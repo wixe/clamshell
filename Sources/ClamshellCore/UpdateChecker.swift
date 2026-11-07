@@ -3,7 +3,7 @@ import Foundation
 import AppKit
 #endif
 
-public let ClamshellVersion = "0.1.0"
+public let ClamshellVersion = "0.2.0"
 
 public struct ReleaseInfo: Codable, Equatable {
     public let version: String

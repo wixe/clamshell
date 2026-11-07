@@ -17,6 +17,7 @@ func printHelp() {
       awake <indefinite|timed|ac|off> [m] Set keep-awake mode (replaces Amphetamine & caffeinate)
       brightness <0-100>                  Set display backlight brightness (0 = full blackout, WindowServer stays on)
       blackout <on|off>                   Toggle automatic 0% backlight when clamshell is closed
+      mute <on|off>                       Toggle automatic built-in speaker mute when clamshell is closed
       idle <seconds|off>                  Turn off backlight after N seconds of open-lid inactivity (e.g. 300 or off)
       floor <5-80>                        Set battery safety floor percentage (default: 20%)
       daemon                              Run the Clamshell governor daemon in the foreground
@@ -89,6 +90,9 @@ func handleStatus(jsonOutput: Bool) {
         ? String(format: "%.0fs", tel.hidIdleSeconds)
         : String(format: "%dm %ds", Int(tel.hidIdleSeconds) / 60, Int(tel.hidIdleSeconds) % 60)
     let idlePolicyStr = cfg.idleDimSeconds > 0 ? "\(cfg.idleDimSeconds)s (\(cfg.idleDimSeconds / 60)m)" : "Disabled"
+    let speakerStr = tel.builtInSpeakersMuted
+        ? "🔇 Muted (Physical Speakers Silent • Remote/Virtual Audio Active)"
+        : "🔊 Unmuted (Output: \(tel.audioOutputDeviceName))"
 
     print("""
     ========================================================================
@@ -96,9 +100,10 @@ func handleStatus(jsonOutput: Bool) {
     ========================================================================
       Clamshell State:    \(lidStr)
       Display Backlight:  \(brightStr)
+      Built-in Speakers:  \(speakerStr)
       WindowServer GPU:   \(tel.displayOnline ? "Online" : "Offline") (\(tel.displayResolution))
       Keep-Awake Mode:    \(governorMode)
-      Closed Blackout:    \(cfg.clamshellBlackoutEnabled ? "Enabled (0% when closed, auto-restore when opened)" : "Disabled")
+      Closed Blackout:    \(cfg.clamshellBlackoutEnabled ? "Enabled (0% LCD)" : "Disabled")  •  Speaker Mute: \(cfg.muteSpeakersWhenClosed ? "Enabled (🔇)" : "Disabled")
       Open-Lid Idle Off:  \(idlePolicyStr) (Current Idle: \(idleStr))
       Power & Battery:    \(powerStr)  •  Safety Floor: \(cfg.batteryFloorPercent)%
       Kernel Sleep Lock:  \(tel.sleepDisabledKernel ? "Active (SleepDisabled=1)" : "Standard (SleepDisabled=0)")
@@ -181,6 +186,23 @@ func handleBlackout(args: [String]) {
     sendOrFallback("BLACKOUT \(enabled ? "on" : "off")", fallback: { cfg in
         cfg.clamshellBlackoutEnabled = enabled
     }, successMessage: "Closed-clamshell display blackout \(enabled ? "ENABLED" : "DISABLED").")
+}
+
+func handleMute(args: [String]) {
+    guard let first = args.first?.lowercased() else {
+        print("❌ Usage: clamshell mute <on|off>")
+        exit(1)
+    }
+    let enabled = ["on", "true", "1", "yes"].contains(first)
+    let tel = HardwareMonitor().readTelemetry()
+    if enabled && tel.isClamshellClosed {
+        _ = AudioOutputController.shared.setBuiltInSpeakersMuted(true)
+    } else if !enabled {
+        _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
+    }
+    sendOrFallback("MUTE \(enabled ? "on" : "off")", fallback: { cfg in
+        cfg.muteSpeakersWhenClosed = enabled
+    }, successMessage: "Closed-clamshell built-in speaker mute \(enabled ? "ENABLED (🔇)" : "DISABLED (🔊)").")
 }
 
 func handleIdle(args: [String]) {
@@ -406,8 +428,14 @@ case "brightness-sync":
     if let first = subArgs.first, let val = Double(first) {
         _ = DisplayBacklightController.shared.setBrightnessDirect(val)
     }
+case "mute-sync":
+    if let first = subArgs.first {
+        _ = AudioOutputController.shared.setBuiltInSpeakersMutedDirect(first == "1" || first == "true")
+    }
 case "blackout", "lid":
     handleBlackout(args: subArgs)
+case "mute", "speakers", "audio":
+    handleMute(args: subArgs)
 case "idle":
     handleIdle(args: subArgs)
 case "floor", "battery":

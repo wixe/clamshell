@@ -202,6 +202,19 @@ public final class UnixSocketServer {
             governor.updateConfig(cfg, reason: "Closed-clamshell blackout \(enabled ? "enabled" : "disabled")")
             return "{\"success\":true,\"clamshell_blackout_enabled\":\(enabled)}\n"
 
+        case "MUTE":
+            guard isAuthorized else {
+                return "{\"error\":\"Permission denied\"}\n"
+            }
+            guard parts.count >= 2 else {
+                return "{\"error\":\"Usage: MUTE <on|off>\"}\n"
+            }
+            let enabled = ["on", "true", "1", "yes"].contains(parts[1].lowercased())
+            var cfg = governor.config
+            cfg.muteSpeakersWhenClosed = enabled
+            governor.updateConfig(cfg, reason: "Closed-clamshell speaker mute \(enabled ? "enabled" : "disabled")")
+            return "{\"success\":true,\"mute_speakers_when_closed\":\(enabled)}\n"
+
         case "IDLE":
             guard isAuthorized else {
                 return "{\"error\":\"Permission denied\"}\n"
