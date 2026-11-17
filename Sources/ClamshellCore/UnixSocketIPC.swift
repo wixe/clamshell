@@ -21,7 +21,11 @@ public final class UnixSocketServer {
     private var serverFD: Int32 = -1
     private var isRunning = false
     private weak var governor: ClamshellGovernor?
-    private let acceptQueue = DispatchQueue(label: "io.github.wixe.clamshell.ipc", qos: .utility)
+    private let acceptQueue = DispatchQueue(
+        label: "io.github.wixe.clamshell.ipc",
+        qos: .utility,
+        autoreleaseFrequency: .workItem
+    )
 
     public init(socketPath: String = UnixSocketServer.defaultSocketPath, governor: ClamshellGovernor) {
         self.socketPath = socketPath
@@ -39,6 +43,7 @@ public final class UnixSocketServer {
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return }
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
 
         var addr = sockaddr_un()
         guard writeUnixPath(socketPath, into: &addr) else {
@@ -86,9 +91,14 @@ public final class UnixSocketServer {
             }
             if clientFD < 0 {
                 if !isRunning { break }
+                if errno == EINTR { continue }
+                usleep(10_000)
                 continue
             }
-            handleClient(clientFD)
+            _ = fcntl(clientFD, F_SETFD, FD_CLOEXEC)
+            autoreleasepool {
+                handleClient(clientFD)
+            }
         }
     }
 
@@ -250,10 +260,10 @@ public final class UnixSocketServer {
             return "{\"success\":true,\"battery_floor_percent\":\(pct)}\n"
 
         case "UPGRADE":
-            var sourcePath = "\(ClamshellLayout.appBundle)/Contents/Resources/clamshell"
-            if parts.count >= 2 {
-                sourcePath = parts[1]
-            }
+            let customPath = parts.dropFirst().joined(separator: " ")
+            let sourcePath = customPath.isEmpty
+                ? "\(ClamshellLayout.appBundle)/Contents/Resources/clamshell"
+                : customPath
 
             if !isAuthorized && !sourcePath.hasPrefix("/Applications/") {
                 return "{\"error\":\"Permission denied\"}\n"
@@ -326,7 +336,7 @@ public final class UnixSocketServer {
                 _ = SignedBinary.install(from: bundledCLI, to: ClamshellLayout.daemonBinary)
                 _ = SignedBinary.install(from: bundledCLI, to: ClamshellLayout.cliBinary)
                 SignedBinary.stripQuarantineAndSign(ClamshellLayout.daemonBinary)
-                SignedBinary.stripQuarantineAndSign(ClamshellLayout.cliBinary)
+                SignedBinary.stripQuarantineAndSign(ClamshellLayout.daemonBinary == ClamshellLayout.cliBinary ? ClamshellLayout.daemonBinary : ClamshellLayout.cliBinary)
 
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) {
                     exit(0)
@@ -342,24 +352,35 @@ public final class UnixSocketServer {
 }
 
 public enum UnixSocketClient {
+    public static func isSocketPresent(_ socketPath: String = UnixSocketServer.defaultSocketPath) -> Bool {
+        access(socketPath, F_OK) == 0
+    }
+
     public static func send(_ command: String, socketPath: String = UnixSocketServer.defaultSocketPath) -> String? {
-        return sendDirect(command, socketPath: socketPath)
+        autoreleasepool {
+            sendDirect(command, socketPath: socketPath)
+        }
     }
 
     public static func isSuccess(_ response: String?) -> Bool {
-        guard let response,
-              let data = response.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        autoreleasepool {
+            guard let response,
+                  let data = response.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return false
+            }
+            if let ok = obj["success"] as? Bool { return ok }
+            if let number = obj["success"] as? NSNumber { return number.boolValue }
             return false
         }
-        if let ok = obj["success"] as? Bool { return ok }
-        if let number = obj["success"] as? NSNumber { return number.boolValue }
-        return false
     }
 
     private static func sendDirect(_ command: String, socketPath: String) -> String? {
+        guard access(socketPath, F_OK) == 0 else { return nil }
+
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
         defer { close(fd) }
 
         var noSigPipe: Int32 = 1

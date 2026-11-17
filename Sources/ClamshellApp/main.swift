@@ -11,8 +11,16 @@ final class LinkButton: NSButton {
 @MainActor
 final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private let statusMenu = NSMenu()
+    private var lastMenuBarTitle: String = ""
     private var refreshTimer: Timer?
-    private var lidObserverTimer: Timer?
+    private var currentTimerInterval: TimeInterval = 0
+    private var eventObserver: ClamshellEventObserver?
+    private let eventQueue = DispatchQueue(
+        label: "io.github.wixe.clamshell.app-events",
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
+    )
     private var settingsWindow: NSWindow?
 
     // Settings window controls
@@ -47,9 +55,8 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private let monitor = HardwareMonitor()
     private let inAppPower = PowerAssertionController()
-    private var lastObservedClosed: Bool? = nil
-    private var lastObservedIdleBlackout: Bool = false
-    private var wasSpeakerMutedByApp: Bool = false
+    private var localState: GovernorState = .initial
+    private var localTracker: ClamshellTracker = .initial
 
     private let launchAgentPath: String = {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -64,14 +71,23 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             button.title = "🦪 Clamshell"
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         }
+        statusMenu.delegate = self
+        statusItem.menu = statusMenu
 
         if Bundle.main.bundlePath.hasPrefix("/Applications") && !FileManager.default.fileExists(atPath: launchAgentPath) {
             setLaunchAtLogin(true)
         }
 
         evaluateLocalSessionGuard()
-        rebuildMenu()
         autoSyncDaemonIfNeeded()
+
+        let observer = ClamshellEventObserver(queue: eventQueue) { [weak self] in
+            Task { @MainActor in
+                self?.evaluateLocalSessionGuard(triggeredByEvent: true)
+            }
+        }
+        observer.start()
+        self.eventObserver = observer
 
         Task {
             await checkUpdateSilently()
@@ -81,20 +97,7 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             showSettingsWindow()
         }
 
-        // Fast 1s observer for instant lid open/close backlight response in GUI session
-        lidObserverTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.evaluateLocalSessionGuard()
-            }
-        }
-
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.autoSyncDaemonIfNeeded()
-                self?.rebuildMenu()
-                self?.refreshSettingsWindow()
-            }
-        }
+        rescheduleRefreshTimer()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -102,94 +105,134 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         return true
     }
 
-    /// Ensures responsive in-session display backlight switching on lid open/close
-    /// and maintains user-space IOPMAssertions even before the root daemon is installed.
-    private func evaluateLocalSessionGuard() {
-        let tel = monitor.readTelemetry()
-        var cfg = ConfigManager.shared.load()
-        let daemonInfo = fetchDaemonStatus()
+    private func desiredRefreshInterval(isClosed: Bool, config: ClamshellConfig) -> TimeInterval {
+        if let win = settingsWindow, win.isVisible, !win.isMiniaturized {
+            return 1.5
+        }
+        if isClosed && config.mode != .timed {
+            return 10.0
+        }
+        if config.idleDimSeconds > 0 || config.mode == .timed {
+            return 2.5
+        }
+        return 6.0
+    }
 
-        if !daemonInfo.running {
-            let batterySafe = tel.isACConnected || tel.batteryPercent > cfg.batteryFloorPercent
-            let wantAwake: Bool
-            switch cfg.mode {
-            case .indefinite, .timed: wantAwake = batterySafe
-            case .acOnly: wantAwake = batterySafe && tel.isACConnected
-            case .off: wantAwake = false
+    private func rescheduleRefreshTimer(isClosed: Bool? = nil, config: ClamshellConfig? = nil) {
+        let cfg = config ?? ConfigManager.shared.load()
+        let closed = isClosed ?? (localTracker.wasClamshellClosed ?? false)
+        let target = desiredRefreshInterval(isClosed: closed, config: cfg)
+        guard refreshTimer == nil || abs(target - currentTimerInterval) >= 0.4 else { return }
+        refreshTimer?.invalidate()
+        currentTimerInterval = target
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: target, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.evaluateLocalSessionGuard()
+                self.autoSyncDaemonIfNeeded()
+                if let win = self.settingsWindow, win.isVisible, !win.isMiniaturized {
+                    self.refreshSettingsWindow()
+                }
             }
-            inAppPower.setAwakeAssertions(
-                systemAwake: wantAwake,
-                displayWindowServerAwake: wantAwake && cfg.preventDisplaySleep
+        }
+    }
+
+    /// Driven by instant kernel `IOPMrootDomain` lid/power notifications plus an adaptive heartbeat.
+    /// Shares the pure `ClamshellPolicy` functional core with `clamshelld`.
+    private func evaluateLocalSessionGuard(triggeredByEvent: Bool = false) {
+        autoreleasepool {
+            let cfg = ConfigManager.shared.load()
+            let snap = monitor.readGuardSnapshot(includeIdleTime: cfg.idleDimSeconds > 0)
+            let daemonRunning = UnixSocketClient.isSocketPresent()
+            let nowEpoch = Date().timeIntervalSince1970
+            let prevClosed = localTracker.wasClamshellClosed
+
+            let transition = ClamshellPolicy.evaluate(
+                config: cfg,
+                state: localState,
+                tracker: localTracker,
+                telemetry: snap.telemetry,
+                brightnessReadable: snap.brightnessReadable,
+                managePowerAssertions: !daemonRunning,
+                manageKernelSleep: false,
+                nowEpoch: nowEpoch
             )
+
+            localState = transition.state
+            localTracker = transition.tracker
+
+            if daemonRunning {
+                inAppPower.releaseAll()
+            }
+
+            for effect in transition.effects {
+                switch effect {
+                case let .saveConfig(updatedCfg):
+                    if !daemonRunning {
+                        _ = ConfigManager.shared.save(updatedCfg)
+                    }
+                case let .setAwakeAssertions(systemAwake, displayAwake):
+                    inAppPower.setAwakeAssertions(systemAwake: systemAwake, displayWindowServerAwake: displayAwake)
+                case .setKernelSleepDisabled:
+                    break
+                case let .setBrightness(val):
+                    _ = DisplayBacklightController.shared.setBrightnessDirect(val)
+                case let .setSpeakersMuted(muted):
+                    _ = AudioOutputController.shared.setBuiltInSpeakersMutedDirect(muted)
+                }
+            }
+
+            let brightPct = Int((snap.telemetry.currentBrightness * 100.0).rounded())
+            graphView.addSample(
+                brightnessPercent: Double(brightPct),
+                isClamshellClosed: snap.telemetry.isClamshellClosed,
+                isAwake: transition.config.mode != .off
+            )
+
+            updateMenuBarTitleOnly(telemetry: snap.telemetry, config: transition.config)
+            rescheduleRefreshTimer(isClosed: snap.telemetry.isClamshellClosed, config: transition.config)
+
+            if triggeredByEvent || prevClosed != snap.telemetry.isClamshellClosed {
+                if menuIsOpen {
+                    populateMenu(statusMenu)
+                }
+                if let win = settingsWindow, win.isVisible, !win.isMiniaturized {
+                    refreshSettingsWindow()
+                }
+            }
         }
-
-        let prevClosed = lastObservedClosed
-        lastObservedClosed = tel.isClamshellClosed
-
-        if tel.isClamshellClosed {
-            if cfg.muteSpeakersWhenClosed {
-                if !tel.builtInSpeakersMuted {
-                    _ = AudioOutputController.shared.setBuiltInSpeakersMutedDirect(true)
-                }
-                wasSpeakerMutedByApp = true
-            }
-            if cfg.clamshellBlackoutEnabled {
-                if prevClosed == false && tel.currentBrightness > 0.03 {
-                    cfg.savedBrightness = tel.currentBrightness
-                    _ = ConfigManager.shared.save(cfg)
-                }
-                if tel.currentBrightness > 0.005 {
-                    _ = DisplayBacklightController.shared.setBrightnessDirect(0.0)
-                }
-            }
-        } else if prevClosed == true {
-            // Clamshell just opened — restore saved brightness and unmute built-in speakers immediately!
-            lastObservedIdleBlackout = false
-            let restore = max(0.10, min(1.0, cfg.savedBrightness))
-            _ = DisplayBacklightController.shared.setBrightnessDirect(restore)
-            if cfg.muteSpeakersWhenClosed && wasSpeakerMutedByApp {
-                _ = AudioOutputController.shared.setBuiltInSpeakersMutedDirect(false)
-                wasSpeakerMutedByApp = false
-            }
-            rebuildMenu()
-            refreshSettingsWindow()
-        } else if cfg.idleDimSeconds > 0 && tel.hidIdleSeconds >= Double(cfg.idleDimSeconds) {
-            if !lastObservedIdleBlackout {
-                if tel.currentBrightness > 0.03 {
-                    cfg.savedBrightness = tel.currentBrightness
-                    _ = ConfigManager.shared.save(cfg)
-                }
-                _ = DisplayBacklightController.shared.setBrightnessDirect(0.0)
-                lastObservedIdleBlackout = true
-            }
-        } else if lastObservedIdleBlackout && tel.hidIdleSeconds < 3.0 {
-            lastObservedIdleBlackout = false
-            let restore = max(0.10, min(1.0, cfg.savedBrightness))
-            _ = DisplayBacklightController.shared.setBrightnessDirect(restore)
-            rebuildMenu()
-            refreshSettingsWindow()
-        }
-
-        updateMenuBarTitleOnly(telemetry: tel, config: cfg)
     }
 
     private func fetchDaemonStatus() -> (running: Bool, mode: String, version: String?, remainingSec: Int?) {
-        if let liveJson = UnixSocketClient.send("STATUS"),
-           let data = liveJson.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let gov = obj["governor"] as? [String: Any],
-           let mode = gov["mode"] as? String {
-            let version = gov["version"] as? String
-            let rem = gov["remaining_timed_seconds"] as? Int
-            return (true, mode, version, rem)
+        guard UnixSocketClient.isSocketPresent() else {
+            return (false, "In-App Session Mode (Daemon Not Installed)", nil, nil)
         }
-        return (false, "In-App Session Mode (Daemon Not Installed)", nil, nil)
+        return autoreleasepool {
+            if let liveJson = UnixSocketClient.send("STATUS"),
+               let data = liveJson.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let gov = obj["governor"] as? [String: Any],
+               let mode = gov["mode"] as? String {
+                let version = gov["version"] as? String
+                let rem = gov["remaining_timed_seconds"] as? Int
+                return (true, mode, version, rem)
+            }
+            return (false, "In-App Session Mode (Daemon Not Installed)", nil, nil)
+        }
     }
 
     private func rebuildMenu() {
-        guard !menuIsOpen else { return }
+        guard menuIsOpen else {
+            evaluateLocalSessionGuard()
+            return
+        }
+        populateMenu(statusMenu)
+    }
+
+    private func populateMenu(_ menu: NSMenu) {
         replacingMenu = true
         defer { replacingMenu = false }
+        menu.removeAllItems()
 
         let tel = monitor.readTelemetry()
         let cfg = ConfigManager.shared.load()
@@ -204,9 +247,6 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             isClamshellClosed: tel.isClamshellClosed,
             isAwake: cfg.mode != .off
         )
-
-        let menu = NSMenu()
-        menu.delegate = self
 
         if let rel = latestRelease, UpdateChecker.isVersion(rel.version, newerThan: ClamshellVersion) {
             let updateItem = NSMenuItem(title: "⬆️ Update Available (\(rel.tagName))…", action: #selector(triggerAppUpdate), keyEquivalent: "")
@@ -399,8 +439,12 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let quitItem = NSMenuItem(title: "Quit Clamshell Menu Bar", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+    }
 
-        statusItem.menu = menu
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        autoreleasepool {
+            populateMenu(menu)
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -409,9 +453,6 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     func menuDidClose(_ menu: NSMenu) {
         menuIsOpen = false
-        if !replacingMenu {
-            rebuildMenu()
-        }
     }
 
     @objc private func openProjectPage(_ sender: Any?) {
@@ -758,6 +799,13 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         settingsWindow?.makeKeyAndOrderFront(nil)
         refreshSettingsWindow()
         placeSettingsWindowOnScreen()
+        rescheduleRefreshTimer()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            self?.rescheduleRefreshTimer()
+        }
     }
 
     private func refreshSettingsWindow() {
@@ -768,7 +816,6 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let daemonActive = daemonInfo.running
         let upToDate = isDaemonBinaryUpToDate(runningDaemonVersion: daemonInfo.version)
         let brightPct = Int((tel.currentBrightness * 100.0).rounded())
-        let savedPct = Int((cfg.savedBrightness * 100.0).rounded())
 
         let speakerStatus = tel.builtInSpeakersMuted ? "Muted 🔇" : "Unmuted 🔊"
         headerSubLabel?.stringValue = "Lid: \(tel.isClamshellClosed ? "Closed 🦪" : "Open 💻")  •  Backlight: \(brightPct)%  •  Speakers: \(speakerStatus)  •  WindowServer: \(tel.displayOnline ? "Online" : "Offline") (\(tel.displayResolution))"
@@ -934,7 +981,7 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         _ = ConfigManager.shared.save(cfg)
         if !enabled {
             _ = AudioOutputController.shared.setBuiltInSpeakersMutedDirect(false)
-            wasSpeakerMutedByApp = false
+            localState.isSpeakerMutedByClamshell = false
         }
         sendControl("MUTE \(enabled ? "on" : "off")")
         evaluateLocalSessionGuard()
@@ -1154,33 +1201,19 @@ final class ClamshellAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func menuBarSymbol(telemetry: HardwareTelemetry, config: ClamshellConfig) -> String {
-        if config.mode == .off {
-            return "🌙"
-        }
-        if telemetry.isClamshellClosed {
-            return "🦪"
-        }
-        if config.mode == .timed {
-            return "⏱️"
-        }
-        return "☕"
+        ClamshellPolicy.menuBarSymbol(isClamshellClosed: telemetry.isClamshellClosed, mode: config.mode)
     }
 
     private func updateMenuBarTitleOnly(telemetry: HardwareTelemetry, config: ClamshellConfig) {
         guard let button = statusItem.button else { return }
-        let symbol = menuBarSymbol(telemetry: telemetry, config: config)
-        let brightPct = Int((telemetry.currentBrightness * 100.0).rounded())
-        let title: String
-        if config.mode == .off {
-            title = "\(symbol) Off"
-        } else if telemetry.isClamshellClosed {
-            title = "\(symbol) \(brightPct)%"
-        } else if config.mode == .timed, let exp = config.timedExpiresAtEpoch {
-            let remMins = max(1, Int(((exp - Date().timeIntervalSince1970) / 60.0).rounded()))
-            title = "\(symbol) \(remMins)m · \(brightPct)%"
-        } else {
-            title = "\(symbol) \(brightPct)%"
-        }
+        let title = ClamshellPolicy.menuBarTitle(
+            isClamshellClosed: telemetry.isClamshellClosed,
+            currentBrightness: telemetry.currentBrightness,
+            config: config,
+            nowEpoch: Date().timeIntervalSince1970
+        )
+        guard title != lastMenuBarTitle else { return }
+        lastMenuBarTitle = title
         button.title = title
     }
 

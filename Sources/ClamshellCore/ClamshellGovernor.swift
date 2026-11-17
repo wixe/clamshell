@@ -1,246 +1,172 @@
 import Foundation
 
+/// Imperative shell driving `ClamshellPolicy` via instant kernel `IOPMrootDomain` lid events
+/// and an adaptive fallback `DispatchSourceTimer` with deterministic autorelease draining.
 public final class ClamshellGovernor {
     public private(set) var config: ClamshellConfig
     public private(set) var state: GovernorState = .initial
+    private var tracker: ClamshellTracker = .initial
+
     private let monitor = HardwareMonitor()
     private let power = PowerAssertionController()
     private var timer: DispatchSourceTimer?
-    private let queue = DispatchQueue(label: "io.github.wixe.clamshell.governor", qos: .utility)
-
-    private var wasClamshellClosed: Bool? = nil
-    private var wasIdleBlackedOut: Bool = false
-    private var manualBlackoutActive: Bool = false
+    private var eventObserver: ClamshellEventObserver?
+    private var currentTimerInterval: Double = 0
+    private let queue = DispatchQueue(
+        label: "io.github.wixe.clamshell.governor",
+        qos: .utility,
+        autoreleaseFrequency: .workItem
+    )
 
     public init(config: ClamshellConfig) {
         self.config = config
     }
 
-    public func start() {
-        evaluateTick()
+    deinit {
+        eventObserver?.stop()
+        timer?.cancel()
+    }
 
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        let interval = max(1.0, config.pollIntervalSeconds)
-        t.schedule(deadline: .now() + interval, repeating: interval)
-        t.setEventHandler { [weak self] in
+    public func start() {
+        queue.sync {
+            autoreleasepool {
+                self.evaluateTick()
+            }
+        }
+
+        let observer = ClamshellEventObserver(queue: queue) { [weak self] in
             self?.evaluateTick()
+        }
+        observer.start()
+        self.eventObserver = observer
+
+        let interval = desiredTimerInterval()
+        self.currentTimerInterval = interval
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(250))
+        t.setEventHandler { [weak self] in
+            autoreleasepool {
+                self?.evaluateTick()
+            }
         }
         t.resume()
         self.timer = t
     }
 
     public func stop() {
+        eventObserver?.stop()
+        eventObserver = nil
         timer?.cancel()
         timer = nil
-        let tel = monitor.readTelemetry()
-        power.releaseAll()
-        power.setKernelClamshellSleepDisabled(false, currentKernelState: tel.sleepDisabledKernel)
-        if state.isBacklightBlackedOut && !tel.isClamshellClosed {
-            _ = DisplayBacklightController.shared.setBrightness(config.savedBrightness)
-        }
-        if state.isSpeakerMutedByClamshell && !tel.isClamshellClosed {
-            _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
+        autoreleasepool {
+            let tel = monitor.readTelemetry()
+            power.releaseAll()
+            power.setKernelClamshellSleepDisabled(false, currentKernelState: tel.sleepDisabledKernel)
+            if state.isBacklightBlackedOut && !tel.isClamshellClosed {
+                _ = DisplayBacklightController.shared.setBrightness(config.savedBrightness)
+            }
+            if state.isSpeakerMutedByClamshell && !tel.isClamshellClosed {
+                _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
+            }
         }
     }
 
     public func updateConfig(_ newConfig: ClamshellConfig, reason: String = "User updated configuration") {
         queue.sync {
-            let prevMutePolicy = self.config.muteSpeakersWhenClosed
-            self.config = newConfig
-            _ = ConfigManager.shared.save(newConfig)
-            self.state.lastActionReason = reason
-            if prevMutePolicy && !newConfig.muteSpeakersWhenClosed {
-                _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
-                self.state.isSpeakerMutedByClamshell = false
+            autoreleasepool {
+                let prevMutePolicy = self.config.muteSpeakersWhenClosed
+                self.config = newConfig
+                _ = ConfigManager.shared.save(newConfig)
+                self.state.lastActionReason = reason
+                if prevMutePolicy && !newConfig.muteSpeakersWhenClosed {
+                    _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
+                    self.state.isSpeakerMutedByClamshell = false
+                }
+                self.evaluateTick()
             }
-            self.evaluateTick()
         }
     }
 
     public func setManualBrightness(_ value: Double) {
         queue.sync {
-            let clamped = max(0.0, min(1.0, value))
-            _ = DisplayBacklightController.shared.setBrightness(clamped)
-            if clamped > 0.02 {
-                self.manualBlackoutActive = false
-                self.wasIdleBlackedOut = false
-                self.config.savedBrightness = clamped
-                _ = ConfigManager.shared.save(self.config)
-                self.state.isBacklightBlackedOut = false
-                self.state.blackoutReason = "Active (Open Lid)"
-                self.state.lastActionReason = String(format: "Set brightness to %.0f%%", clamped * 100.0)
-            } else {
-                self.manualBlackoutActive = true
-                self.state.isBacklightBlackedOut = true
-                self.state.blackoutReason = "Manual Blackout (0%)"
-                self.state.lastActionReason = "Display backlight manually turned off (0%)"
+            autoreleasepool {
+                let transition = ClamshellPolicy.applyManualBrightness(
+                    value,
+                    config: self.config,
+                    state: self.state,
+                    tracker: self.tracker
+                )
+                self.applyTransition(transition, currentKernelState: false)
             }
         }
     }
 
     public func getCombinedReport() -> [String: Any] {
-        return queue.sync {
-            let tel = monitor.readTelemetry()
-            return ClamshellReport.dictionary(telemetry: tel, config: config, state: state)
+        queue.sync {
+            autoreleasepool {
+                let tel = monitor.readTelemetry()
+                return ClamshellReport.dictionary(telemetry: tel, config: config, state: state)
+            }
         }
     }
 
+    private func desiredTimerInterval() -> Double {
+        if tracker.wasClamshellClosed == true && config.mode != .timed {
+            // Kernel IOPMrootDomain interest notification wakes < 2ms on lid open; 10s safety heartbeat.
+            return max(config.pollIntervalSeconds, 10.0)
+        }
+        if config.idleDimSeconds > 0 || config.mode == .timed {
+            return max(2.0, config.pollIntervalSeconds)
+        }
+        return max(config.pollIntervalSeconds, 6.0)
+    }
+
+    private func rescheduleTimerIfNeeded() {
+        let next = desiredTimerInterval()
+        guard abs(next - currentTimerInterval) >= 0.5, let timer else { return }
+        currentTimerInterval = next
+        timer.schedule(deadline: .now() + next, repeating: next, leeway: .milliseconds(250))
+    }
+
     private func evaluateTick() {
-        let tel = monitor.readTelemetry()
-        let now = Date().timeIntervalSince1970
-
-        // 1. Check timed session expiration
-        var remainingTimed: Int? = nil
-        if config.mode == .timed {
-            if let exp = config.timedExpiresAtEpoch {
-                let rem = Int((exp - now).rounded())
-                if rem <= 0 {
-                    config.mode = .off
-                    config.timedExpiresAtEpoch = nil
-                    _ = ConfigManager.shared.save(config)
-                    state.lastActionReason = "Timed awake session expired"
-                } else {
-                    remainingTimed = rem
-                }
-            } else {
-                let exp = now + Double(config.timedDurationMinutes * 60)
-                config.timedExpiresAtEpoch = exp
-                _ = ConfigManager.shared.save(config)
-                remainingTimed = config.timedDurationMinutes * 60
+        autoreleasepool {
+            let diskCfg = ConfigManager.shared.load()
+            if diskCfg != config {
+                config = diskCfg
             }
+            let snap = monitor.readGuardSnapshot(includeIdleTime: config.idleDimSeconds > 0)
+            let transition = ClamshellPolicy.evaluate(
+                config: config,
+                state: state,
+                tracker: tracker,
+                telemetry: snap.telemetry,
+                brightnessReadable: snap.brightnessReadable,
+                managePowerAssertions: true,
+                manageKernelSleep: getuid() == 0,
+                nowEpoch: Date().timeIntervalSince1970
+            )
+            applyTransition(transition, currentKernelState: snap.telemetry.sleepDisabledKernel)
+            rescheduleTimerIfNeeded()
         }
-        state.remainingTimedSeconds = remainingTimed
+    }
 
-        // 2. Determine whether system should be kept awake
-        let batterySafe = tel.isACConnected || tel.batteryPercent > config.batteryFloorPercent
-        let wantAwake: Bool
-        let modeDesc: String
+    private func applyTransition(_ transition: ClamshellTransition, currentKernelState: Bool) {
+        self.config = transition.config
+        self.state = transition.state
+        self.tracker = transition.tracker
 
-        if !batterySafe && config.mode != .off {
-            wantAwake = false
-            modeDesc = "Battery Safety Pause (< \(config.batteryFloorPercent)%)"
-        } else {
-            switch config.mode {
-            case .indefinite:
-                wantAwake = true
-                modeDesc = tel.isClamshellClosed
-                    ? "Clamshell Closed • Server Awake (Backlight Off)"
-                    : "Awake Indefinitely (24/7)"
-            case .timed:
-                wantAwake = true
-                let mins = max(1, (remainingTimed ?? 60) / 60)
-                modeDesc = "Timed Session (\(mins)m remaining)"
-            case .acOnly:
-                wantAwake = tel.isACConnected
-                modeDesc = tel.isACConnected
-                    ? (tel.isClamshellClosed ? "AC Power • Clamshell Awake" : "Awake on AC Power")
-                    : "On Battery (Sleep Allowed)"
-            case .off:
-                wantAwake = false
-                modeDesc = "Normal macOS Sleep (Off)"
-            }
-        }
-
-        state.isAwakeAsserted = wantAwake
-        state.modeDescription = modeDesc
-
-        power.setAwakeAssertions(
-            systemAwake: wantAwake,
-            displayWindowServerAwake: wantAwake && config.preventDisplaySleep
-        )
-        power.setKernelClamshellSleepDisabled(wantAwake, currentKernelState: tel.sleepDisabledKernel)
-
-        // 3. Clamshell & Idle Display Backlight + Built-in Speaker Mute State Machine
-        let prevClosed = wasClamshellClosed
-        wasClamshellClosed = tel.isClamshellClosed
-
-        if tel.isClamshellClosed {
-            if config.muteSpeakersWhenClosed {
-                if !tel.builtInSpeakersMuted {
-                    _ = AudioOutputController.shared.setBuiltInSpeakersMuted(true)
-                }
-                state.isSpeakerMutedByClamshell = true
-            }
-            if config.clamshellBlackoutEnabled {
-                if prevClosed == false && tel.currentBrightness > 0.03 {
-                    config.savedBrightness = tel.currentBrightness
-                    _ = ConfigManager.shared.save(config)
-                }
-                if tel.currentBrightness > 0.005 {
-                    _ = DisplayBacklightController.shared.setBrightness(0.0)
-                    state.lastActionReason = "Clamshell closed → 0% backlight & speakers muted"
-                }
-                state.isBacklightBlackedOut = true
-                state.blackoutReason = "Clamshell Closed (0% Backlight)"
-            } else {
-                state.isBacklightBlackedOut = (tel.currentBrightness <= 0.01)
-                state.blackoutReason = "Clamshell Closed"
-            }
-            return
-        }
-
-        // Clamshell is OPEN:
-        if prevClosed == true {
-            manualBlackoutActive = false
-            wasIdleBlackedOut = false
-            let restoreVal = max(0.10, min(1.0, config.savedBrightness))
-            _ = DisplayBacklightController.shared.setBrightness(restoreVal)
-            if config.muteSpeakersWhenClosed && state.isSpeakerMutedByClamshell {
-                _ = AudioOutputController.shared.setBuiltInSpeakersMuted(false)
-                state.isSpeakerMutedByClamshell = false
-            }
-            state.isBacklightBlackedOut = false
-            state.blackoutReason = "Active (Open Lid)"
-            state.lastActionReason = String(format: "Clamshell opened → Restored %.0f%% brightness & unmuted speakers", restoreVal * 100.0)
-            return
-        }
-
-        // Check open-lid idle timeout
-        if config.idleDimSeconds > 0 && tel.hidIdleSeconds >= Double(config.idleDimSeconds) {
-            if !wasIdleBlackedOut {
-                if tel.currentBrightness > 0.03 {
-                    config.savedBrightness = tel.currentBrightness
-                    _ = ConfigManager.shared.save(config)
-                }
-                _ = DisplayBacklightController.shared.setBrightness(0.0)
-                wasIdleBlackedOut = true
-                state.lastActionReason = "Idle timeout (\(config.idleDimSeconds)s) → Display backlight off"
-            } else if tel.currentBrightness > 0.005 {
-                _ = DisplayBacklightController.shared.setBrightness(0.0)
-            }
-            state.isBacklightBlackedOut = true
-            state.blackoutReason = "Idle Dimmed (\(Int(tel.hidIdleSeconds))s idle)"
-            return
-        }
-
-        if wasIdleBlackedOut && tel.hidIdleSeconds < 3.0 {
-            wasIdleBlackedOut = false
-            manualBlackoutActive = false
-            let restoreVal = max(0.10, min(1.0, config.savedBrightness))
-            _ = DisplayBacklightController.shared.setBrightness(restoreVal)
-            state.isBacklightBlackedOut = false
-            state.blackoutReason = "Active (Open Lid)"
-            state.lastActionReason = String(format: "Input detected → Restored brightness to %.0f%%", restoreVal * 100.0)
-            return
-        }
-
-        if !manualBlackoutActive && tel.currentBrightness > 0.03 {
-            if abs(tel.currentBrightness - config.savedBrightness) >= 0.03 {
-                config.savedBrightness = tel.currentBrightness
-                _ = ConfigManager.shared.save(config)
-            }
-            state.isBacklightBlackedOut = false
-            state.blackoutReason = "Active (Open Lid)"
-        } else if manualBlackoutActive {
-            if tel.currentBrightness > 0.03 {
-                manualBlackoutActive = false
-                config.savedBrightness = tel.currentBrightness
-                _ = ConfigManager.shared.save(config)
-                state.isBacklightBlackedOut = false
-                state.blackoutReason = "Active (Open Lid)"
-            } else {
-                state.isBacklightBlackedOut = true
-                state.blackoutReason = "Manual Blackout (0%)"
+        for effect in transition.effects {
+            switch effect {
+            case let .saveConfig(cfg):
+                _ = ConfigManager.shared.save(cfg)
+            case let .setAwakeAssertions(systemAwake, displayAwake):
+                power.setAwakeAssertions(systemAwake: systemAwake, displayWindowServerAwake: displayAwake)
+            case let .setKernelSleepDisabled(disabled):
+                power.setKernelClamshellSleepDisabled(disabled, currentKernelState: currentKernelState)
+            case let .setBrightness(val):
+                _ = DisplayBacklightController.shared.setBrightness(val)
+            case let .setSpeakersMuted(muted):
+                _ = AudioOutputController.shared.setBuiltInSpeakersMuted(muted)
             }
         }
     }

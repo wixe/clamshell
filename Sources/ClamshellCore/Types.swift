@@ -1,6 +1,6 @@
 import Foundation
 
-public enum AwakeMode: String, Codable, CaseIterable, Equatable {
+public enum AwakeMode: String, Codable, CaseIterable, Equatable, Sendable {
     case indefinite = "indefinite"
     case timed = "timed"
     case acOnly = "ac_only"
@@ -25,7 +25,7 @@ public enum AwakeMode: String, Codable, CaseIterable, Equatable {
     }
 }
 
-public struct ClamshellConfig: Codable, Equatable {
+public struct ClamshellConfig: Codable, Equatable, Sendable {
     public var mode: AwakeMode
     public var timedDurationMinutes: Int
     public var timedExpiresAtEpoch: Double?
@@ -81,7 +81,7 @@ public struct ClamshellConfig: Codable, Equatable {
     public static let `default` = ClamshellConfig()
 }
 
-public struct HardwareTelemetry: Codable, Equatable {
+public struct HardwareTelemetry: Codable, Equatable, Sendable {
     public let isClamshellClosed: Bool
     public let currentBrightness: Double
     public let displayOnline: Bool
@@ -130,7 +130,7 @@ public struct HardwareTelemetry: Codable, Equatable {
     }
 }
 
-public struct GovernorState: Codable, Equatable {
+public struct GovernorState: Codable, Equatable, Sendable {
     public var isAwakeAsserted: Bool
     public var isBacklightBlackedOut: Bool
     public var isSpeakerMutedByClamshell: Bool

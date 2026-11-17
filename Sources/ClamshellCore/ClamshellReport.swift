@@ -1,6 +1,22 @@
 import Foundation
+import Darwin
 
 public enum ClamshellReport {
+    public static func formatISO8601(_ date: Date) -> String {
+        var secs = time_t(date.timeIntervalSince1970)
+        var tmVal = tm()
+        gmtime_r(&secs, &tmVal)
+        return String(
+            format: "%04d-%02d-%02dT%02d:%02d:%02dZ",
+            Int(tmVal.tm_year) + 1900,
+            Int(tmVal.tm_mon) + 1,
+            Int(tmVal.tm_mday),
+            Int(tmVal.tm_hour),
+            Int(tmVal.tm_min),
+            Int(tmVal.tm_sec)
+        )
+    }
+
     public static func dictionary(
         telemetry: HardwareTelemetry,
         config: ClamshellConfig,
@@ -8,11 +24,11 @@ public enum ClamshellReport {
     ) -> [String: Any] {
         return [
             "version": ClamshellVersion,
-            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "timestamp": formatISO8601(Date()),
             "telemetry": [
                 "clamshell_closed": telemetry.isClamshellClosed,
                 "brightness_percent": Int((telemetry.currentBrightness * 100.0).rounded()),
-                "brightness_raw": Double(String(format: "%.3f", telemetry.currentBrightness)) ?? telemetry.currentBrightness,
+                "brightness_raw": (telemetry.currentBrightness * 1000.0).rounded() / 1000.0,
                 "display_online": telemetry.displayOnline,
                 "display_resolution": telemetry.displayResolution,
                 "built_in_speakers_muted": telemetry.builtInSpeakersMuted,
@@ -21,7 +37,7 @@ public enum ClamshellReport {
                 "ac_connected": telemetry.isACConnected,
                 "is_charging": telemetry.isCharging,
                 "battery_percent": telemetry.batteryPercent,
-                "wattage_w": Double(String(format: "%.2f", telemetry.wattageW)) ?? telemetry.wattageW,
+                "wattage_w": (telemetry.wattageW * 100.0).rounded() / 100.0,
                 "sleep_disabled_kernel": telemetry.sleepDisabledKernel,
                 "screen_locked": telemetry.screenLocked,
                 "thermal_state": telemetry.thermalState

@@ -42,7 +42,9 @@ public final class TelemetryGraphView: NSView {
                 samples.removeFirst(samples.count - maxSamples)
             }
         }
-        needsDisplay = true
+        if window?.isVisible == true {
+            needsDisplay = true
+        }
     }
 
     public override func draw(_ dirtyRect: NSRect) {

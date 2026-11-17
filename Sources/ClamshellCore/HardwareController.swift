@@ -4,11 +4,51 @@ import IOKit.pwr_mgt
 import CoreGraphics
 import CoreAudio
 import Darwin
+import notify
 
 public final class AudioOutputController {
     public static let shared = AudioOutputController()
 
-    private init() {}
+    private let lock = NSLock()
+    private let listenerQueue = DispatchQueue(
+        label: "io.github.wixe.clamshell.audio-events",
+        qos: .utility,
+        autoreleaseFrequency: .workItem
+    )
+    private var cachedSpeakerID: (at: Date, id: AudioDeviceID?)?
+    private var cachedDefaultOutputName: (at: Date, name: String)?
+
+    private init() {
+        registerPropertyListeners()
+    }
+
+    private func registerPropertyListeners() {
+        let sysObj = AudioObjectID(kAudioObjectSystemObject)
+        var devicesAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        _ = AudioObjectAddPropertyListenerBlock(sysObj, &devicesAddr, listenerQueue) { [weak self] _, _ in
+            self?.invalidateCache()
+        }
+
+        var defaultAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        _ = AudioObjectAddPropertyListenerBlock(sysObj, &defaultAddr, listenerQueue) { [weak self] _, _ in
+            self?.invalidateCache()
+        }
+    }
+
+    public func invalidateCache() {
+        lock.lock()
+        cachedSpeakerID = nil
+        cachedDefaultOutputName = nil
+        lock.unlock()
+    }
 
     private func allDeviceIDs() -> [AudioDeviceID] {
         var addr = AudioObjectPropertyAddress(
@@ -29,19 +69,21 @@ public final class AudioOutputController {
         return devices
     }
 
+    /// CoreAudio `kAudioObjectPropertyName` returns a +1 retained `CFStringRef`.
+    /// Transferring via `Unmanaged<CFString>?.takeRetainedValue()` prevents leaking a `CFString` on every query.
     private func deviceName(_ id: AudioDeviceID) -> String {
         var addr = AudioObjectPropertyAddress(
             mSelector: kAudioObjectPropertyName,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var cfName: CFString = "" as CFString
-        var size = UInt32(MemoryLayout<CFString>.size)
+        var cfName: Unmanaged<CFString>? = nil
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = withUnsafeMutablePointer(to: &cfName) { ptr in
             AudioObjectGetPropertyData(id, &addr, 0, nil, &size, ptr)
         }
-        if status == noErr {
-            return cfName as String
+        if status == noErr, let retained = cfName?.takeRetainedValue() {
+            return retained as String
         }
         return "Audio Output"
     }
@@ -73,25 +115,37 @@ public final class AudioOutputController {
         return transport
     }
 
-    /// Finds the physical built-in MacBook speaker device (excluding external/virtual/AirPlay/ScreenSharing outputs).
     public func findBuiltInSpeakerDeviceID() -> AudioDeviceID? {
-        let candidates = allDeviceIDs().filter { id in
-            hasOutputStreams(id) && transportType(id) == kAudioDeviceTransportTypeBuiltIn
+        let now = Date()
+        lock.lock()
+        if let cached = cachedSpeakerID, now.timeIntervalSince(cached.at) < 30.0 {
+            let id = cached.id
+            lock.unlock()
+            return id
         }
-        for id in candidates {
-            let name = deviceName(id).lowercased()
-            if name.contains("speaker") {
-                return id
+        lock.unlock()
+
+        let resolved: AudioDeviceID? = autoreleasepool {
+            let candidates = allDeviceIDs().filter { id in
+                hasOutputStreams(id) && transportType(id) == kAudioDeviceTransportTypeBuiltIn
             }
-        }
-        // Fallback to any built-in output that isn't headphones
-        for id in candidates {
-            let name = deviceName(id).lowercased()
-            if !name.contains("headphone") {
-                return id
+            for id in candidates {
+                if deviceName(id).lowercased().contains("speaker") {
+                    return id
+                }
             }
+            for id in candidates {
+                if !deviceName(id).lowercased().contains("headphone") {
+                    return id
+                }
+            }
+            return candidates.first
         }
-        return candidates.first
+
+        lock.lock()
+        cachedSpeakerID = (now, resolved)
+        lock.unlock()
+        return resolved
     }
 
     public func defaultOutputDeviceID() -> AudioDeviceID? {
@@ -110,8 +164,24 @@ public final class AudioOutputController {
     }
 
     public func defaultOutputDeviceName() -> String {
-        guard let id = defaultOutputDeviceID() else { return "None" }
-        return deviceName(id)
+        let now = Date()
+        lock.lock()
+        if let cached = cachedDefaultOutputName, now.timeIntervalSince(cached.at) < 30.0 {
+            let name = cached.name
+            lock.unlock()
+            return name
+        }
+        lock.unlock()
+
+        let name: String = autoreleasepool {
+            guard let id = defaultOutputDeviceID() else { return "None" }
+            return deviceName(id)
+        }
+
+        lock.lock()
+        cachedDefaultOutputName = (now, name)
+        lock.unlock()
+        return name
     }
 
     public func isBuiltInSpeakersMuted() -> Bool {
@@ -213,27 +283,48 @@ public final class DisplayBacklightController {
         }
     }
 
-    public func getBrightness() -> Double {
-        let did = CGMainDisplayID()
+    /// Finds the physical built-in Apple LCD (`CGDisplayIsBuiltin`), ignoring virtual Screen Sharing
+    /// or external displays so closed-clamshell backlight control always targets the physical panel.
+    public func builtInDisplayID() -> CGDirectDisplayID? {
+        var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(UInt32(displays.count), &displays, &count) == .success, count > 0 else {
+            let main = CGMainDisplayID()
+            return (CGDisplayIsOnline(main) != 0 && CGDisplayIsBuiltin(main) != 0) ? main : nil
+        }
+        return displays.prefix(Int(count)).first(where: { CGDisplayIsBuiltin($0) != 0 })
+    }
+
+    /// Returns hardware brightness in `0.0...1.0` when the physical built-in display is online and readable,
+    /// or `nil` when offline/virtual-only so callers never mistake a virtual Screen Sharing display for 100%.
+    public func readBrightness() -> Double? {
+        guard let did = builtInDisplayID() else { return nil }
         if let dsGet = dsGet {
             var val: Float = 0.0
-            if dsGet(did, &val) == 0 {
+            if dsGet(did, &val) == 0, val.isFinite {
                 return Double(max(0.0, min(1.0, val)))
             }
         }
         if let cdGet = cdGet {
             let val = cdGet(did)
-            if val >= 0.0 && val <= 1.0 {
+            if val.isFinite, val >= 0.0, val <= 1.0 {
                 return val
             }
         }
-        return 0.65
+        return nil
+    }
+
+    public func getBrightness() -> Double {
+        if let actual = readBrightness() {
+            return actual
+        }
+        return 0.0
     }
 
     @discardableResult
     public func setBrightnessDirect(_ value: Double) -> Bool {
         let clamped = Float(max(0.0, min(1.0, value)))
-        let did = CGMainDisplayID()
+        guard let did = builtInDisplayID() else { return false }
         var ok = false
         if let dsSet = dsSet {
             if dsSet(did, clamped) == 0 {
@@ -269,55 +360,139 @@ public final class DisplayBacklightController {
 }
 
 public final class HardwareMonitor {
-    public init() {}
+    private let lock = NSLock()
+    private var pmRootService: io_service_t = IO_OBJECT_NULL
+    private var hidService: io_service_t = IO_OBJECT_NULL
+    private var batteryService: io_service_t = IO_OBJECT_NULL
+    private var cachedBattery: (at: Date, info: (isAC: Bool, isCharging: Bool, percent: Int, wattageW: Double))?
 
-    public func readTelemetry() -> HardwareTelemetry {
-        let rootStatus = readPMRootDomain()
-        let idleSec = readHIDIdleSeconds()
-        let batt = readBatteryInfo()
-        let brightness = DisplayBacklightController.shared.getBrightness()
-        let speakersMuted = AudioOutputController.shared.isBuiltInSpeakersMuted()
-        let outDevice = AudioOutputController.shared.defaultOutputDeviceName()
-
-        let mainID = CGMainDisplayID()
-        let online = CGDisplayIsOnline(mainID) != 0
-        let w = CGDisplayPixelsWide(mainID)
-        let h = CGDisplayPixelsHigh(mainID)
-        let res = (w > 0 && h > 0) ? "\(w)×\(h)" : "Headless/Virtual"
-
-        let thermal: String
-        switch ProcessInfo.processInfo.thermalState {
-        case .nominal: thermal = "Nominal"
-        case .fair: thermal = "Fair"
-        case .serious: thermal = "Serious"
-        case .critical: thermal = "Critical"
-        @unknown default: thermal = "Nominal"
-        }
-
-        return HardwareTelemetry(
-            isClamshellClosed: rootStatus.clamshellClosed,
-            currentBrightness: brightness,
-            displayOnline: online,
-            displayResolution: res,
-            builtInSpeakersMuted: speakersMuted,
-            audioOutputDeviceName: outDevice,
-            hidIdleSeconds: idleSec,
-            isACConnected: batt.isAC,
-            isCharging: batt.isCharging,
-            batteryPercent: batt.percent,
-            wattageW: batt.wattageW,
-            sleepDisabledKernel: rootStatus.sleepDisabled,
-            screenLocked: rootStatus.screenLocked,
-            thermalState: thermal
-        )
+    public init() {
+        self.pmRootService = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        self.hidService = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        self.batteryService = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
     }
 
-    private func readPMRootDomain() -> (clamshellClosed: Bool, sleepDisabled: Bool, screenLocked: Bool) {
-        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    deinit {
+        if pmRootService != IO_OBJECT_NULL {
+            IOObjectRelease(pmRootService)
+            pmRootService = IO_OBJECT_NULL
+        }
+        if hidService != IO_OBJECT_NULL {
+            IOObjectRelease(hidService)
+            hidService = IO_OBJECT_NULL
+        }
+        if batteryService != IO_OBJECT_NULL {
+            IOObjectRelease(batteryService)
+            batteryService = IO_OBJECT_NULL
+        }
+    }
+
+    /// Lightweight snapshot for background guard loops. Skips expensive `IOConsoleUsers`,
+    /// resolution string allocation, and `HIDIdleTime` when lid is closed or idle dim is off.
+    public func readGuardSnapshot(includeIdleTime: Bool) -> (telemetry: HardwareTelemetry, brightnessReadable: Bool) {
+        autoreleasepool {
+            let rootStatus = readPMRootDomain(includeScreenLocked: false)
+            let idleSec = (!rootStatus.clamshellClosed && includeIdleTime) ? readHIDIdleSeconds() : 0.0
+            let batt = readBatteryInfo(maxAge: 10.0)
+            let rawBright = DisplayBacklightController.shared.readBrightness()
+            let brightness = rawBright ?? 0.0
+            let speakersMuted = AudioOutputController.shared.isBuiltInSpeakersMuted()
+
+            let tel = HardwareTelemetry(
+                isClamshellClosed: rootStatus.clamshellClosed,
+                currentBrightness: brightness,
+                displayOnline: rawBright != nil || CGDisplayIsOnline(CGMainDisplayID()) != 0,
+                displayResolution: "",
+                builtInSpeakersMuted: speakersMuted,
+                audioOutputDeviceName: "",
+                hidIdleSeconds: idleSec,
+                isACConnected: batt.isAC,
+                isCharging: batt.isCharging,
+                batteryPercent: batt.percent,
+                wattageW: batt.wattageW,
+                sleepDisabledKernel: rootStatus.sleepDisabled,
+                screenLocked: false,
+                thermalState: "Nominal"
+            )
+            return (tel, rawBright != nil)
+        }
+    }
+
+    public func readTelemetry() -> HardwareTelemetry {
+        autoreleasepool {
+            let rootStatus = readPMRootDomain(includeScreenLocked: true)
+            let idleSec = readHIDIdleSeconds()
+            let batt = readBatteryInfo(maxAge: 1.0)
+            let brightness = DisplayBacklightController.shared.getBrightness()
+            let speakersMuted = AudioOutputController.shared.isBuiltInSpeakersMuted()
+            let outDevice = AudioOutputController.shared.defaultOutputDeviceName()
+
+            let mainID = CGMainDisplayID()
+            let online = CGDisplayIsOnline(mainID) != 0
+            let w = CGDisplayPixelsWide(mainID)
+            let h = CGDisplayPixelsHigh(mainID)
+            let res = (w > 0 && h > 0) ? "\(w)×\(h)" : "Headless/Virtual"
+
+            let thermal: String
+            switch ProcessInfo.processInfo.thermalState {
+            case .nominal: thermal = "Nominal"
+            case .fair: thermal = "Fair"
+            case .serious: thermal = "Serious"
+            case .critical: thermal = "Critical"
+            @unknown default: thermal = "Nominal"
+            }
+
+            return HardwareTelemetry(
+                isClamshellClosed: rootStatus.clamshellClosed,
+                currentBrightness: brightness,
+                displayOnline: online,
+                displayResolution: res,
+                builtInSpeakersMuted: speakersMuted,
+                audioOutputDeviceName: outDevice,
+                hidIdleSeconds: idleSec,
+                isACConnected: batt.isAC,
+                isCharging: batt.isCharging,
+                batteryPercent: batt.percent,
+                wattageW: batt.wattageW,
+                sleepDisabledKernel: rootStatus.sleepDisabled,
+                screenLocked: rootStatus.screenLocked,
+                thermalState: thermal
+            )
+        }
+    }
+
+    private func ensurePMRootService() -> io_service_t {
+        lock.lock()
+        defer { lock.unlock() }
+        if pmRootService == IO_OBJECT_NULL {
+            pmRootService = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        }
+        return pmRootService
+    }
+
+    private func ensureHIDService() -> io_service_t {
+        lock.lock()
+        defer { lock.unlock() }
+        if hidService == IO_OBJECT_NULL {
+            hidService = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        }
+        return hidService
+    }
+
+    private func ensureBatteryService() -> io_service_t {
+        lock.lock()
+        defer { lock.unlock() }
+        if batteryService == IO_OBJECT_NULL {
+            batteryService = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        }
+        return batteryService
+    }
+
+    private func readPMRootDomain(includeScreenLocked: Bool) -> (clamshellClosed: Bool, sleepDisabled: Bool, screenLocked: Bool) {
+        let service = ensurePMRootService()
         guard service != IO_OBJECT_NULL else {
             return (false, false, false)
         }
-        defer { IOObjectRelease(service) }
 
         var closed = false
         if let prop = IORegistryEntryCreateCFProperty(service, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool {
@@ -330,14 +505,16 @@ public final class HardwareMonitor {
         }
 
         var locked = false
-        let rootEntry = IORegistryGetRootEntry(kIOMainPortDefault)
-        if rootEntry != IO_OBJECT_NULL {
-            defer { IOObjectRelease(rootEntry) }
-            if let users = IORegistryEntryCreateCFProperty(rootEntry, "IOConsoleUsers" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? [[String: Any]] {
-                for u in users {
-                    if let l = u["CGSSessionScreenIsLocked"] as? Bool, l {
-                        locked = true
-                        break
+        if includeScreenLocked {
+            let rootEntry = IORegistryGetRootEntry(kIOMainPortDefault)
+            if rootEntry != IO_OBJECT_NULL {
+                defer { IOObjectRelease(rootEntry) }
+                if let users = IORegistryEntryCreateCFProperty(rootEntry, "IOConsoleUsers" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? [[String: Any]] {
+                    for u in users {
+                        if let l = u["CGSSessionScreenIsLocked"] as? Bool, l {
+                            locked = true
+                            break
+                        }
                     }
                 }
             }
@@ -347,9 +524,8 @@ public final class HardwareMonitor {
     }
 
     private func readHIDIdleSeconds() -> Double {
-        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        let service = ensureHIDService()
         guard service != IO_OBJECT_NULL else { return 0.0 }
-        defer { IOObjectRelease(service) }
 
         if let num = IORegistryEntryCreateCFProperty(service, "HIDIdleTime" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber {
             return max(0.0, num.doubleValue / 1_000_000_000.0)
@@ -357,12 +533,22 @@ public final class HardwareMonitor {
         return 0.0
     }
 
-    private func readBatteryInfo() -> (isAC: Bool, isCharging: Bool, percent: Int, wattageW: Double) {
-        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+    private func readBatteryInfo(maxAge: TimeInterval) -> (isAC: Bool, isCharging: Bool, percent: Int, wattageW: Double) {
+        let now = Date()
+        if maxAge > 0 {
+            lock.lock()
+            if let cached = cachedBattery, now.timeIntervalSince(cached.at) < maxAge {
+                let info = cached.info
+                lock.unlock()
+                return info
+            }
+            lock.unlock()
+        }
+
+        let service = ensureBatteryService()
         guard service != IO_OBJECT_NULL else {
             return (true, false, 100, 0.0)
         }
-        defer { IOObjectRelease(service) }
 
         var dictRef: Unmanaged<CFMutableDictionary>?
         guard IORegistryEntryCreateCFProperties(service, &dictRef, kCFAllocatorDefault, 0) == KERN_SUCCESS,
@@ -385,8 +571,93 @@ public final class HardwareMonitor {
         let mv = (dict["Voltage"] as? Int) ?? 0
         let ma = (dict["InstantAmperage"] as? Int) ?? (dict["Amperage"] as? Int) ?? 0
         let watts = (Double(mv) * Double(ma)) / 1_000_000.0
+        let result = (isAC, isCharging, pct, watts)
 
-        return (isAC, isCharging, pct, watts)
+        lock.lock()
+        cachedBattery = (now, result)
+        lock.unlock()
+        return result
+    }
+}
+
+/// Zero-CPU kernel event observer for `IOPMrootDomain` (`AppleClamshellState` Hall-effect sensor
+/// and system sleep/power transitions) plus Darwin power-source notifications.
+public final class ClamshellEventObserver {
+    private let queue: DispatchQueue
+    private let onChange: () -> Void
+    private var notifyPort: IONotificationPortRef?
+    private var interestNotification: io_object_t = IO_OBJECT_NULL
+    private var powerSourceToken: Int32 = NOTIFY_TOKEN_INVALID
+    private var isStarted = false
+
+    public init(queue: DispatchQueue, onChange: @escaping () -> Void) {
+        self.queue = queue
+        self.onChange = onChange
+    }
+
+    deinit {
+        stop()
+    }
+
+    public func start() {
+        guard !isStarted else { return }
+        isStarted = true
+
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        if service != IO_OBJECT_NULL {
+            defer { IOObjectRelease(service) }
+            if let port = IONotificationPortCreate(kIOMainPortDefault) {
+                IONotificationPortSetDispatchQueue(port, queue)
+                self.notifyPort = port
+
+                let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+                let callback: IOServiceInterestCallback = { refcon, _, _, _ in
+                    guard let refcon else { return }
+                    let observer = Unmanaged<ClamshellEventObserver>.fromOpaque(refcon).takeUnretainedValue()
+                    autoreleasepool {
+                        observer.onChange()
+                    }
+                }
+                var notif: io_object_t = IO_OBJECT_NULL
+                if IOServiceAddInterestNotification(
+                    port,
+                    service,
+                    kIOGeneralInterest,
+                    callback,
+                    selfPtr,
+                    &notif
+                ) == KERN_SUCCESS {
+                    self.interestNotification = notif
+                }
+            }
+        }
+
+        var token: Int32 = NOTIFY_TOKEN_INVALID
+        if notify_register_dispatch("com.apple.system.powersources.source", &token, queue, { [weak self] _ in
+            autoreleasepool {
+                self?.onChange()
+            }
+        }) == NOTIFY_STATUS_OK {
+            self.powerSourceToken = token
+        }
+    }
+
+    public func stop() {
+        guard isStarted else { return }
+        isStarted = false
+
+        if interestNotification != IO_OBJECT_NULL {
+            IOObjectRelease(interestNotification)
+            interestNotification = IO_OBJECT_NULL
+        }
+        if let port = notifyPort {
+            IONotificationPortDestroy(port)
+            notifyPort = nil
+        }
+        if powerSourceToken != NOTIFY_TOKEN_INVALID {
+            notify_cancel(powerSourceToken)
+            powerSourceToken = NOTIFY_TOKEN_INVALID
+        }
     }
 }
 
